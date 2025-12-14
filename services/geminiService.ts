@@ -3,15 +3,52 @@ import { JobListing, UserProfile, InterviewQuestion, SkillGapAnalysis } from "..
 
 // Helper to get AI instance using the API key from environment variables
 const getAI = () => {
-  const apiKey = process.env.API_KEY;
+  // Check both process.env (injected via vite define) and import.meta.env (native vite)
+  const apiKey = process.env.API_KEY || (import.meta as any).env?.VITE_API_KEY;
   
-  if (!apiKey || apiKey === "undefined" || apiKey.includes("your_actual_gemini")) {
+  if (!apiKey || apiKey === "undefined") {
     throw new Error(
-      "Gemini API Key is missing. Please create a .env file in the root directory with 'API_KEY=your_key_here' and restart the server."
+      "Gemini API Key is missing. Please check your environment variables."
     );
   }
 
   return new GoogleGenAI({ apiKey });
+};
+
+// Bulletproof JSON extractor
+const extractJSON = (text: string): any => {
+  if (!text) return null;
+
+  // 1. Remove Markdown code blocks
+  let cleanText = text.replace(/```json\s*|\s*```/g, ''); 
+  cleanText = cleanText.replace(/```/g, '');
+
+  // 2. Find the outer-most array or object
+  const firstBracket = cleanText.indexOf('[');
+  const lastBracket = cleanText.lastIndexOf(']');
+  const firstBrace = cleanText.indexOf('{');
+  const lastBrace = cleanText.lastIndexOf('}');
+
+  // Determine if it looks like an array or object and extract substring
+  if (firstBracket !== -1 && lastBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+     cleanText = cleanText.substring(firstBracket, lastBracket + 1);
+  } else if (firstBrace !== -1 && lastBrace !== -1) {
+     cleanText = cleanText.substring(firstBrace, lastBrace + 1);
+  }
+
+  try {
+    return JSON.parse(cleanText);
+  } catch (e) {
+    console.warn("JSON Parse Warning, attempting manual cleanup:", e);
+    // 3. Last ditch effort: remove trailing commas (common AI error)
+    try {
+      cleanText = cleanText.replace(/,\s*([\]}])/g, '$1');
+      return JSON.parse(cleanText);
+    } catch (e2) {
+      console.error("Failed to parse JSON response:", text);
+      return null;
+    }
+  }
 };
 
 /**
@@ -50,7 +87,7 @@ export const parseResume = async (base64Data: string, mimeType: string): Promise
       }
     });
 
-    return JSON.parse(response.text || '{}');
+    return extractJSON(response.text || '{}') || {};
   } catch (error) {
     console.error("Resume parsing failed:", error);
     throw new Error("Failed to parse resume. Please ensure the file is clear and try again.");
@@ -76,7 +113,7 @@ export const suggestRoles = async (resumeText: string): Promise<string[]> => {
         }
       }
     });
-    return JSON.parse(response.text || '[]');
+    return extractJSON(response.text || '[]') || [];
   } catch (error) {
     console.error("Role suggestion failed:", error);
     return [];
@@ -113,7 +150,7 @@ export const generateInterviewQuestions = async (job: JobListing, profile: UserP
         }
       }
     });
-    return JSON.parse(response.text || '[]');
+    return extractJSON(response.text || '[]') || [];
   } catch (error) {
     console.error("Interview prep failed:", error);
     throw new Error("Failed to generate interview questions.");
@@ -127,17 +164,20 @@ export const searchJobsWithGemini = async (profile: UserProfile): Promise<JobLis
   const ai = getAI();
   
   const query = `
-    Find recent (posted in last 5 days) job openings for ${profile.targetRoles.join(' or ')} in ${profile.locations.join(' or ')}. 
+    Find 5 real, recently posted job listings (last 7 days) for "${profile.targetRoles.join('" or "')}" in "${profile.locations.join('" or "')}".
     
-    CRITICAL SEARCH CRITERIA:
-    - Return REAL job listings found via Google Search.
-    - Prioritize listings from company career pages, LinkedIn, Indeed, or Glassdoor.
+    CRITICAL: You MUST return a VALID JSON ARRAY. Do not add any conversational text.
     
-    Output Format:
-    Return a strictly formatted JSON array of objects.
-    Example: [{"title": "Software Engineer", "company": "Tech Corp", "location": "New York", "description": "React developer needed...", "url": "https://..."}]
-    
-    Do not include markdown formatting like \`\`\`json. Just return the raw JSON string.
+    Structure:
+    [
+      {
+        "title": "Job Title",
+        "company": "Company Name",
+        "location": "City, Country",
+        "description": "Brief summary",
+        "url": "Application URL or Career Page URL" 
+      }
+    ]
   `;
 
   try {
@@ -145,35 +185,24 @@ export const searchJobsWithGemini = async (profile: UserProfile): Promise<JobLis
       model: 'gemini-2.5-flash',
       contents: query,
       config: {
-        tools: [{ googleSearch: {} }],
+        tools: [{ googleSearch: {} }]
       }
     });
 
-    let text = response.text || '[]';
-    // Aggressive cleanup
-    text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const text = response.text || '';
+    console.log("Raw Search Response:", text); // Debugging
 
-    let rawJobs;
-    try {
-        // Try direct parse
-        rawJobs = JSON.parse(text);
-    } catch (e) {
-        // Fallback: Try to find array bracket content
-        const match = text.match(/\[.*\]/s);
-        if (match) {
-            try {
-                rawJobs = JSON.parse(match[0]);
-            } catch (e2) {
-                console.error("Failed to parse regex match", e2);
-                throw new Error("Invalid format");
-            }
-        } else {
-             console.error("No JSON array found in response", text);
-             throw new Error("Invalid response format from AI.");
-        }
+    let rawJobs = extractJSON(text);
+    
+    // Handle case where it's wrapped in { jobs: [...] }
+    if (rawJobs && !Array.isArray(rawJobs) && Array.isArray(rawJobs.jobs)) {
+        rawJobs = rawJobs.jobs;
     }
     
-    if (!Array.isArray(rawJobs)) return [];
+    if (!Array.isArray(rawJobs)) {
+        console.warn("Could not extract JSON array from search response.");
+        return [];
+    }
 
     return rawJobs.map((job: any) => ({
       title: job.title || 'Unknown Role',
@@ -188,7 +217,7 @@ export const searchJobsWithGemini = async (profile: UserProfile): Promise<JobLis
     }));
   } catch (error) {
     console.error("Job search failed:", error);
-    throw error;
+    return [];
   }
 };
 
@@ -204,7 +233,7 @@ export const analyzeAndApply = async (job: JobListing, profile: UserProfile): Pr
     Candidate Profile:
     Name: ${profile.name}
     Skills: ${profile.skills.join(', ')}
-    Experience Summary: ${profile.resumeText}
+    Experience Summary: ${profile.resumeText ? profile.resumeText.slice(0, 800) : "Not provided"}
 
     Target Job:
     Title: ${job.title}
@@ -212,9 +241,9 @@ export const analyzeAndApply = async (job: JobListing, profile: UserProfile): Pr
     Description: ${job.description}
 
     Task:
-    1. Calculate a match score (0-100) based on skills and experience overlap.
-    2. Write a professional, persuasive, and concise cover letter tailored specifically to this job description.
-    3. Provide a brief one-sentence reason for the score.
+    1. Calculate a Match Score (0-100) based on skills overlap.
+    2. Write a professional, concise Cover Letter (max 200 words).
+    3. Write a one-sentence analysis note.
   `;
 
   try {
@@ -234,98 +263,90 @@ export const analyzeAndApply = async (job: JobListing, profile: UserProfile): Pr
       }
     });
 
-    return JSON.parse(response.text || '{"matchScore": 0, "coverLetter": "", "notes": "Error"}');
+    const result = extractJSON(response.text || '{}');
+    
+    return {
+      matchScore: typeof result?.matchScore === 'number' ? result.matchScore : 50,
+      coverLetter: result?.coverLetter || "Could not generate cover letter.",
+      notes: result?.notes || "Analysis incomplete."
+    };
   } catch (error) {
     console.error("Analysis failed:", error);
     throw error;
   }
 };
 
-/**
- * Generates cold outreach messages
- */
 export const generateNetworkingMessage = async (
-    type: 'linkedin' | 'email', 
-    targetName: string, 
-    company: string, 
-    role: string, 
+    type: 'linkedin' | 'email',
+    targetName: string,
+    company: string,
+    role: string,
     profile: UserProfile
 ): Promise<string> => {
     const ai = getAI();
     const prompt = `
-      Write a ${type === 'linkedin' ? 'short connection request (max 300 chars)' : 'cold email'} 
-      to ${targetName || 'a Hiring Manager'} at ${company} regarding the ${role} position.
-      
-      My Name: ${profile.name}
-      My Key Skills: ${profile.skills.slice(0, 3).join(', ')}
-      My Experience: ${profile.resumeText.slice(0, 300)}...
-      
-      Tone: Professional, concise, and high-value. Focus on how I can help them.
+      Write a ${type === 'linkedin' ? 'short LinkedIn connection request (max 300 chars)' : 'cold email'} 
+      to ${targetName} at ${company} regarding the ${role} position.
+      My name is ${profile.name}.
+      My key strength is: ${profile.skills.slice(0,3).join(', ')}.
+      Tone: Professional, concise, and persuasive.
+      Return only the message text.
     `;
-  
+
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-      });
-  
-      return response.text || '';
-    } catch (error) {
-      console.error("Networking generation failed:", error);
-      return "Error generating message.";
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt
+        });
+        return response.text || "Failed to generate message.";
+    } catch (e) {
+        console.error(e);
+        throw e;
     }
-  };
+};
 
-/**
- * Analyzes Skills Gap
- */
 export const analyzeSkillGap = async (profile: UserProfile): Promise<SkillGapAnalysis> => {
-  const ai = getAI();
-  const prompt = `
-    Analyze the skill gap for this candidate.
-    
-    Candidate Skills: ${profile.skills.join(', ')}
-    Target Roles: ${profile.targetRoles.join(', ')}
-    Experience: ${profile.resumeText.slice(0, 1000)}
+    const ai = getAI();
+    const prompt = `
+      Analyze the skill gap for a candidate targeting: ${profile.targetRoles.join(', ')}.
+      Candidate Skills: ${profile.skills.join(', ')}.
+      
+      Return JSON with:
+      - missingSkills: list of 3-5 critical skills missing.
+      - learningPath: array of { skill, resource (name of book/course/doc), actionItem }.
+      - projectIdea: A specific project idea to build to demonstrate these skills.
+    `;
 
-    Task:
-    1. Identify top 3 critical missing skills required for the target roles that the candidate seems to lack.
-    2. For each missing skill, suggest a concrete learning resource (generic name of course/book) and an action item.
-    3. Suggest one capstone project idea that would demonstrate these new skills.
-
-    Return JSON.
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            missingSkills: { type: Type.ARRAY, items: { type: Type.STRING } },
-            learningPath: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  skill: { type: Type.STRING },
-                  resource: { type: Type.STRING },
-                  actionItem: { type: Type.STRING }
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        missingSkills: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        learningPath: { 
+                            type: Type.ARRAY, 
+                            items: { 
+                                type: Type.OBJECT, 
+                                properties: {
+                                    skill: { type: Type.STRING },
+                                    resource: { type: Type.STRING },
+                                    actionItem: { type: Type.STRING }
+                                } 
+                            } 
+                        },
+                        projectIdea: { type: Type.STRING }
+                    }
                 }
-              }
-            },
-            projectIdea: { type: Type.STRING }
-          }
-        }
-      }
-    });
-
-    return JSON.parse(response.text || '{}');
-  } catch (error) {
-    console.error("Skill gap analysis failed:", error);
-    throw new Error("Failed to analyze skill gap.");
-  }
+            }
+        });
+        
+        return extractJSON(response.text || '{}') || { missingSkills: [], learningPath: [], projectIdea: "Analysis failed" };
+    } catch (e) {
+        console.error(e);
+        throw e;
+    }
 };
