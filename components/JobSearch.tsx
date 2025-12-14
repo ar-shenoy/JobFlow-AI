@@ -6,7 +6,7 @@ import { Search, Loader2, Plus, Globe, CheckSquare, Square, PenTool, Wifi, WifiO
 interface JobSearchProps {
   profile: UserProfile;
   addJobsToQueue: (jobs: JobListing[]) => void;
-  showToast: (msg: string, type: 'success' | 'error') => void;
+  showToast: (msg: string, type: 'success' | 'error' | 'info') => void;
 }
 
 const JobSearch: React.FC<JobSearchProps> = ({ profile, addJobsToQueue, showToast }) => {

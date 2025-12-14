@@ -6,7 +6,7 @@ import { parseResume, suggestRoles } from '../services/geminiService';
 interface ProfileProps {
   profile: UserProfile;
   setProfile: (p: UserProfile) => void;
-  showToast: (msg: string, type: 'success' | 'error') => void;
+  showToast: (msg: string, type: 'success' | 'error' | 'info') => void;
 }
 
 // --- CONSTANTS & MOCK DATA ---

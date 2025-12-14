@@ -13,7 +13,7 @@ interface AutoPilotProps {
   addLog: (msg: string, type?: AutomationLog['type']) => void;
   stats: { totalFound: number; applied: number; skipped: number };
   updateStats: (key: 'applied' | 'skipped') => void;
-  showToast: (msg: string, type: 'success' | 'error') => void;
+  showToast: (msg: string, type: 'success' | 'error' | 'info') => void;
 }
 
 const AutoPilot: React.FC<AutoPilotProps> = memo(({ 
