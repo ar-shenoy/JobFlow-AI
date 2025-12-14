@@ -1,352 +1,305 @@
-import { GoogleGenAI, Type } from "@google/genai";
-import { JobListing, UserProfile, InterviewQuestion, SkillGapAnalysis } from "../types";
+import { GoogleGenAI } from "@google/genai";
+import { pipeline } from "@xenova/transformers";
+import { JobListing, UserProfile, InterviewQuestion, SkillGapAnalysis, ResumeOptimization } from "../types";
+import { getAggregatedJobs } from "./jobSources";
 
-// Helper to get AI instance using the API key from environment variables
-const getAI = () => {
-  // Check both process.env (injected via vite define) and import.meta.env (native vite)
-  const apiKey = process.env.API_KEY || (import.meta as any).env?.VITE_API_KEY;
-  
-  if (!apiKey || apiKey === "undefined") {
-    throw new Error(
-      "Gemini API Key is missing. Please check your environment variables."
-    );
+// --- CONFIG ---
+const MODEL_NAME = 'gemini-2.5-flash';
+
+// --- UTILITIES ---
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function retryOperation<T>(operation: () => Promise<T>, retries = 2): Promise<T> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await operation();
+    } catch (err: any) {
+      if (i === retries - 1) throw err;
+      if (err.message?.includes('429') || err.message?.includes('quota') || err.status === 429) {
+        throw err; // Fail fast on quota to trigger local fallback
+      } else {
+        await delay(1000 * Math.pow(2, i));
+      }
+    }
   }
+  throw new Error("Max retries exceeded");
+}
 
+const getAI = () => {
+  const apiKey = process.env.API_KEY || (import.meta as any).env?.VITE_API_KEY;
+  if (!apiKey || apiKey === "undefined" || apiKey.includes("your_key")) {
+    return null;
+  }
   return new GoogleGenAI({ apiKey });
 };
 
-// Bulletproof JSON extractor
 const extractJSON = (text: string): any => {
   if (!text) return null;
-
-  // 1. Remove Markdown code blocks
-  let cleanText = text.replace(/```json\s*|\s*```/g, ''); 
-  cleanText = cleanText.replace(/```/g, '');
-
-  // 2. Find the outer-most array or object
-  const firstBracket = cleanText.indexOf('[');
-  const lastBracket = cleanText.lastIndexOf(']');
-  const firstBrace = cleanText.indexOf('{');
-  const lastBrace = cleanText.lastIndexOf('}');
-
-  // Determine if it looks like an array or object and extract substring
-  if (firstBracket !== -1 && lastBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
-     cleanText = cleanText.substring(firstBracket, lastBracket + 1);
-  } else if (firstBrace !== -1 && lastBrace !== -1) {
-     cleanText = cleanText.substring(firstBrace, lastBrace + 1);
-  }
-
   try {
+    let cleanText = text.replace(/```json\s*|\s*```/g, '').replace(/```/g, '').trim();
+    const firstBrace = cleanText.indexOf('{');
+    const firstBracket = cleanText.indexOf('[');
+    if (firstBrace === -1 && firstBracket === -1) return null;
+    const start = (firstBrace > -1 && (firstBracket === -1 || firstBrace < firstBracket)) ? firstBrace : firstBracket;
+    const end = (start === firstBrace) ? cleanText.lastIndexOf('}') : cleanText.lastIndexOf(']');
+    if (start === -1 || end === -1) return null;
+    cleanText = cleanText.substring(start, end + 1);
     return JSON.parse(cleanText);
-  } catch (e) {
-    console.warn("JSON Parse Warning, attempting manual cleanup:", e);
-    // 3. Last ditch effort: remove trailing commas (common AI error)
-    try {
-      cleanText = cleanText.replace(/,\s*([\]}])/g, '$1');
-      return JSON.parse(cleanText);
-    } catch (e2) {
-      console.error("Failed to parse JSON response:", text);
-      return null;
-    }
-  }
+  } catch (e) { return null; }
 };
 
-/**
- * Extracts structured data from a Resume (PDF/Image base64 or Text)
- */
-export const parseResume = async (base64Data: string, mimeType: string): Promise<Partial<UserProfile>> => {
-  const ai = getAI();
-  
-  const prompt = `
-    Analyze this resume. Extract the candidate's name, email, phone, list of top 10 key skills, 
-    and a summary of their professional experience text.
-    Return the response in JSON.
-  `;
+// --- LOCAL INTELLIGENCE ENGINES ---
 
+const COMMON_SKILLS = [
+  "python", "javascript", "typescript", "react", "node", "java", "c++", "c#", "go", "rust", 
+  "aws", "azure", "gcp", "docker", "kubernetes", "sql", "nosql", "mongodb", "postgresql", 
+  "git", "ci/cd", "agile", "scrum", "machine learning", "ai", "pandas", "numpy", "pytorch", 
+  "tensorflow", "html", "css", "redux", "graphql", "next.js", "vue", "angular"
+];
+
+const STOP_WORDS = new Set(["the", "and", "a", "to", "of", "in", "for", "with", "on", "at", "from", "by", "an", "is", "it", "that", "this", "are", "be", "or", "as", "will", "can", "if", "not", "we", "you", "our", "your", "role", "experience", "work", "team", "skills", "years", "knowledge", "working", "using", "development", "design", "support", "business", "application", "systems", "solutions", "software", "engineer", "developer"]);
+
+// 1. Local Keyword Extractor (TF-IDF Simulation)
+const extractKeywordsLocally = (text: string): string[] => {
+  const words = text.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+  const frequency: Record<string, number> = {};
+  
+  words.forEach(w => {
+    if (!STOP_WORDS.has(w) && w.length > 2 && !/^\d+$/.test(w)) {
+      frequency[w] = (frequency[w] || 0) + 1;
+    }
+  });
+
+  return Object.entries(frequency)
+    .sort((a, b) => b[1] - a[1]) // Sort by frequency
+    .slice(0, 15) // Top 15 keywords
+    .map(e => e[0]);
+};
+
+// 2. Local Role Suggester based on Skill Detection
+const suggestRolesLocally = (text: string): string[] => {
+  const t = text.toLowerCase();
+  const roles = new Set<string>();
+
+  if (t.includes('react') || t.includes('vue') || t.includes('css') || t.includes('frontend')) roles.add("Frontend Engineer");
+  if (t.includes('node') || t.includes('python') || t.includes('java') || t.includes('backend')) roles.add("Backend Engineer");
+  if ((t.includes('react') && t.includes('node')) || t.includes('full stack')) roles.add("Full Stack Developer");
+  if (t.includes('design') || t.includes('figma')) roles.add("Product Designer");
+  if (t.includes('product') && t.includes('manager')) roles.add("Product Manager");
+  if (t.includes('data') || t.includes('sql') || t.includes('python')) roles.add("Data Engineer");
+  
+  // Default fallbacks
+  if (roles.size === 0) return ["Software Engineer", "Remote Developer", "Tech Specialist"];
+  return Array.from(roles);
+};
+
+// 3. Local Resume Optimizer
+const optimizeResumeLocally = (jobDesc: string, resumeText: string): ResumeOptimization => {
+  const jobKeywords = extractKeywordsLocally(jobDesc);
+  const resumeLower = resumeText.toLowerCase();
+  
+  const missingKeywords = jobKeywords.filter(k => !resumeLower.includes(k));
+  const foundKeywords = jobKeywords.filter(k => resumeLower.includes(k));
+  
+  const score = Math.round((foundKeywords.length / jobKeywords.length) * 100);
+  
+  // Normalize score to be realistic (hard to get 100%)
+  const adjustedScore = Math.min(98, Math.max(30, score + 20));
+
+  return {
+    score: adjustedScore,
+    missingKeywords: missingKeywords.map(k => k.charAt(0).toUpperCase() + k.slice(1)), // Capitalize
+    suggestedImprovements: [
+      `Add specific experience with "${missingKeywords.slice(0,2).join('" and "')}" to your summary.`,
+      `Quantify your impact using numbers (e.g., "Improved ${foundKeywords[0] || 'performance'} by 20%").`,
+      "Ensure your skills section explicitly lists the missing technologies found above."
+    ],
+    optimizedSummary: `Passionate professional with strong expertise in ${foundKeywords.slice(0,3).join(', ')}. Eager to leverage skills in ${missingKeywords.slice(0,2).join(' and ')} to drive success at the company. Proven track record of delivering high-quality solutions.`
+  };
+};
+
+// --- AGENT RUNNER ---
+
+async function runSmartAgent<T>(apiCall: () => Promise<T>, fallbackLogic: () => T | Promise<T>): Promise<T> {
+  const ai = getAI();
+  if (!ai) return fallbackLogic();
   try {
+    return await retryOperation(apiCall);
+  } catch (error: any) {
+    // Check for 429 or generic fetch errors to trigger fallback
+    if (error.message?.includes('429') || error.status === 429 || error.message?.includes('quota')) {
+       console.warn("Gemini Rate Limit (429). Switching to Local Intelligence Engine.");
+       return fallbackLogic();
+    }
+    console.error("Gemini Error:", error.message);
+    return fallbackLogic();
+  }
+}
+
+// --- EXPORTED FUNCTIONS ---
+
+export const parseResume = async (base64Data: string, mimeType: string): Promise<Partial<UserProfile>> => {
+  const decodedText = atob(base64Data);
+  const fallback = {
+    name: "Candidate",
+    email: decodedText.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/)?.[0] || "",
+    skills: COMMON_SKILLS.filter(s => decodedText.toLowerCase().includes(s)),
+    resumeText: decodedText.substring(0, 2000), 
+    aiPersona: "Tech Professional (Local)"
+  };
+
+  return runSmartAgent(async () => {
+    const ai = getAI();
+    if(!ai) throw new Error("No Key");
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: MODEL_NAME,
       contents: {
         parts: [
           { inlineData: { mimeType, data: base64Data } },
-          { text: prompt }
+          { text: "Extract JSON: name, email, phone, location, linkedinUrl, portfolioUrl, education, skills[], resumeText, aiPersona." }
         ]
       },
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            name: { type: Type.STRING },
-            email: { type: Type.STRING },
-            phone: { type: Type.STRING },
-            skills: { type: Type.ARRAY, items: { type: Type.STRING } },
-            resumeText: { type: Type.STRING, description: "A detailed summary of experience suitable for matching against job descriptions." }
-          }
-        }
-      }
+      config: { responseMimeType: 'application/json' }
     });
-
-    return extractJSON(response.text || '{}') || {};
-  } catch (error) {
-    console.error("Resume parsing failed:", error);
-    throw new Error("Failed to parse resume. Please ensure the file is clear and try again.");
-  }
+    return extractJSON(response.text || '{}') || fallback;
+  }, () => fallback);
 };
 
-/**
- * Suggests job titles based on resume text
- */
 export const suggestRoles = async (resumeText: string): Promise<string[]> => {
-  const ai = getAI();
-  const prompt = `Based on the following professional experience, suggest 5 relevant and specific job titles this candidate should apply for. Return only a JSON array of strings.\n\nExperience:\n${resumeText.slice(0, 2000)}`;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
-        }
-      }
-    });
-    return extractJSON(response.text || '[]') || [];
-  } catch (error) {
-    console.error("Role suggestion failed:", error);
-    return [];
-  }
-};
-
-/**
- * Generates interview preparation questions
- */
-export const generateInterviewQuestions = async (job: JobListing, profile: UserProfile): Promise<InterviewQuestion[]> => {
-  const ai = getAI();
-  const prompt = `
-    Generate 5 technical and behavioral interview questions for a ${job.title} role at ${job.company}.
-    Based on the candidate's skills: ${profile.skills.join(', ')}.
-    Provide suggested answers and key talking points.
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              question: { type: Type.STRING },
-              suggestedAnswer: { type: Type.STRING },
-              keyPoints: { type: Type.ARRAY, items: { type: Type.STRING } }
-            }
-          }
-        }
-      }
-    });
-    return extractJSON(response.text || '[]') || [];
-  } catch (error) {
-    console.error("Interview prep failed:", error);
-    throw new Error("Failed to generate interview questions.");
-  }
-};
-
-/**
- * Searches for jobs using Google Search Grounding
- */
-export const searchJobsWithGemini = async (profile: UserProfile): Promise<JobListing[]> => {
-  const ai = getAI();
-  
-  const query = `
-    Find 5 real, recently posted job listings (last 7 days) for "${profile.targetRoles.join('" or "')}" in "${profile.locations.join('" or "')}".
-    
-    CRITICAL: You MUST return a VALID JSON ARRAY. Do not add any conversational text.
-    
-    Structure:
-    [
-      {
-        "title": "Job Title",
-        "company": "Company Name",
-        "location": "City, Country",
-        "description": "Brief summary",
-        "url": "Application URL or Career Page URL" 
-      }
-    ]
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: query,
-      config: {
-        tools: [{ googleSearch: {} }]
-      }
-    });
-
-    const text = response.text || '';
-    console.log("Raw Search Response:", text); // Debugging
-
-    let rawJobs = extractJSON(text);
-    
-    // Handle case where it's wrapped in { jobs: [...] }
-    if (rawJobs && !Array.isArray(rawJobs) && Array.isArray(rawJobs.jobs)) {
-        rawJobs = rawJobs.jobs;
-    }
-    
-    if (!Array.isArray(rawJobs)) {
-        console.warn("Could not extract JSON array from search response.");
-        return [];
-    }
-
-    return rawJobs.map((job: any) => ({
-      title: job.title || 'Unknown Role',
-      company: job.company || 'Unknown Company',
-      location: job.location || 'Remote',
-      description: job.description || 'No description available',
-      url: job.url || '#',
-      id: Math.random().toString(36).substr(2, 9),
-      source: 'Gemini Search',
-      status: 'new',
-      postedDate: new Date().toISOString()
-    }));
-  } catch (error) {
-    console.error("Job search failed:", error);
-    return [];
-  }
-};
-
-/**
- * Analyzes a job for fit and generates a cover letter
- */
-export const analyzeAndApply = async (job: JobListing, profile: UserProfile): Promise<{ matchScore: number, coverLetter: string, notes: string }> => {
-  const ai = getAI();
-
-  const prompt = `
-    You are an expert career automation agent.
-    
-    Candidate Profile:
-    Name: ${profile.name}
-    Skills: ${profile.skills.join(', ')}
-    Experience Summary: ${profile.resumeText ? profile.resumeText.slice(0, 800) : "Not provided"}
-
-    Target Job:
-    Title: ${job.title}
-    Company: ${job.company}
-    Description: ${job.description}
-
-    Task:
-    1. Calculate a Match Score (0-100) based on skills overlap.
-    2. Write a professional, concise Cover Letter (max 200 words).
-    3. Write a one-sentence analysis note.
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            matchScore: { type: Type.NUMBER },
-            coverLetter: { type: Type.STRING },
-            notes: { type: Type.STRING }
-          }
-        }
-      }
-    });
-
-    const result = extractJSON(response.text || '{}');
-    
-    return {
-      matchScore: typeof result?.matchScore === 'number' ? result.matchScore : 50,
-      coverLetter: result?.coverLetter || "Could not generate cover letter.",
-      notes: result?.notes || "Analysis incomplete."
-    };
-  } catch (error) {
-    console.error("Analysis failed:", error);
-    throw error;
-  }
-};
-
-export const generateNetworkingMessage = async (
-    type: 'linkedin' | 'email',
-    targetName: string,
-    company: string,
-    role: string,
-    profile: UserProfile
-): Promise<string> => {
+  return runSmartAgent(async () => {
     const ai = getAI();
-    const prompt = `
-      Write a ${type === 'linkedin' ? 'short LinkedIn connection request (max 300 chars)' : 'cold email'} 
-      to ${targetName} at ${company} regarding the ${role} position.
-      My name is ${profile.name}.
-      My key strength is: ${profile.skills.slice(0,3).join(', ')}.
-      Tone: Professional, concise, and persuasive.
-      Return only the message text.
-    `;
+    if(!ai) throw new Error("No Key");
+    const response = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: `Suggest 5 specific job titles based on this resume text: ${resumeText.slice(0, 1000)}. Return JSON array of strings.`,
+      config: { responseMimeType: 'application/json' }
+    });
+    return extractJSON(response.text || '[]') || suggestRolesLocally(resumeText);
+  }, () => suggestRolesLocally(resumeText)); 
+};
 
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt
-        });
-        return response.text || "Failed to generate message.";
-    } catch (e) {
-        console.error(e);
-        throw e;
+export const searchJobsWithGemini = async (profile: UserProfile): Promise<JobListing[]> => {
+  const aiResult = await runSmartAgent<JobListing[]>(async () => {
+    const ai = getAI();
+    if(!ai) throw new Error("No Key");
+    const loc = profile.remoteOnly ? 'Remote' : (profile.preferredRegions.join(', ') || 'Remote');
+    const query = `Find 5 ${profile.experienceLevel} ${profile.targetRoles[0]} jobs in ${loc}. JSON: title, company, location, url, description.`;
+    
+    const response = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: query,
+      config: { tools: [{ googleSearch: {} }] }
+    });
+    const jobs = extractJSON(response.text || '');
+    if (Array.isArray(jobs) && jobs.length > 0) {
+       return jobs.map((j: any) => ({
+        id: Math.random().toString(36).substr(2, 9),
+        title: j.title || 'Job',
+        company: j.company || 'Unknown',
+        location: j.location || 'Remote',
+        url: j.url || '#',
+        description: j.description || '',
+        source: 'Gemini Search',
+        status: 'new',
+        postedDate: new Date().toISOString()
+      }));
     }
+    return [];
+  }, async () => []);
+
+  // Use the aggregator with the FIRST target role
+  const publicJobs = await getAggregatedJobs(profile.targetRoles[0] || 'software developer', profile.experienceLevel);
+  
+  const combined = [...aiResult, ...publicJobs];
+  
+  // Local Post-Filtering for Seniority
+  const EXCLUDE_SENIOR = ['senior', 'lead', 'principal', 'staff', 'manager', 'head', 'director', 'vp'];
+  if (profile.experienceLevel === 'Entry Level' || profile.experienceLevel === 'Internship') {
+     return combined.filter(j => !EXCLUDE_SENIOR.some(ex => j.title.toLowerCase().includes(ex)));
+  }
+
+  return combined;
+};
+
+export const analyzeAndApply = async (job: JobListing, profile: UserProfile): Promise<{ matchScore: number, coverLetter: string, notes: string }> => {
+  return runSmartAgent(async () => {
+    const ai = getAI();
+    if(!ai) throw new Error("No Key");
+    const res = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: `Match ${profile.resumeText.slice(0,1000)} to ${job.description.slice(0,1000)}. JSON: matchScore, coverLetter, notes.`,
+      config: { responseMimeType: 'application/json' }
+    });
+    return extractJSON(res.text || '{}');
+  }, async () => {
+    // FALLBACK: Use Local Keyword Matching
+    const optimization = optimizeResumeLocally(job.description, profile.resumeText || profile.skills.join(' '));
+    return {
+      matchScore: optimization.score,
+      coverLetter: `Dear Hiring Manager,\n\nI am writing to express my enthusiasm for the ${job.title} position at ${job.company}. With my background in ${profile.skills.slice(0,3).join(', ')}, I am confident I can contribute effectively.\n\nBest regards,\n${profile.name}`,
+      notes: `Local Analysis: Matches keywords like ${optimization.missingKeywords.length === 0 ? 'perfectly' : 'partially'}.`
+    };
+  });
+};
+
+export const generateInterviewQuestions = async (job: JobListing, profile: UserProfile): Promise<InterviewQuestion[]> => {
+  return runSmartAgent(async () => {
+    const ai = getAI();
+    if(!ai) throw new Error("No Key");
+    const res = await ai.models.generateContent({
+        model: MODEL_NAME,
+        contents: `3 interview questions for ${job.title} at ${job.company}. JSON array.`,
+        config: { responseMimeType: 'application/json' }
+    });
+    return extractJSON(res.text || '[]') || [];
+  }, () => [
+    { question: `How does your experience align with the ${job.title} role?`, suggestedAnswer: "Discuss specific projects.", keyPoints: ["Relevance", "Skills"] },
+    { question: "What is your greatest technical challenge?", suggestedAnswer: "STAR Method.", keyPoints: ["Problem Solving"] },
+    { question: "Why do you want to work here?", suggestedAnswer: "Mention company mission.", keyPoints: ["Culture"] }
+  ]);
+};
+
+export const analyzeResumeForJob = async (job: JobListing, profile: UserProfile): Promise<ResumeOptimization> => {
+  // Try AI first, then failover to robust local analysis
+  return runSmartAgent(async () => {
+    const ai = getAI();
+    if(!ai) throw new Error("No Key");
+    const res = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: `Compare Resume vs ${job.title}. JSON: score, missingKeywords[], suggestedImprovements[], optimizedSummary.`,
+      config: { responseMimeType: 'application/json' }
+    });
+    return extractJSON(res.text || '{}');
+  }, async () => optimizeResumeLocally(job.description, profile.resumeText || ''));
+};
+
+export const generateNetworkingMessage = async (type: string, targetName: string, company: string, role: string, profile: UserProfile): Promise<string> => {
+    return runSmartAgent(async () => {
+      const ai = getAI();
+      if(!ai) throw new Error("No Key");
+      const res = await ai.models.generateContent({ 
+        model: MODEL_NAME, 
+        contents: `Write a ${type} to ${targetName} at ${company} for ${role}. My name: ${profile.name}. Text only.` 
+      });
+      return res.text || "";
+    }, () => `Hi ${targetName},\n\nI noticed you work at ${company}. I'm a ${role} with experience in ${profile.skills[0] || 'tech'} and would love to connect.\n\nBest,\n${profile.name}`);
 };
 
 export const analyzeSkillGap = async (profile: UserProfile): Promise<SkillGapAnalysis> => {
-    const ai = getAI();
-    const prompt = `
-      Analyze the skill gap for a candidate targeting: ${profile.targetRoles.join(', ')}.
-      Candidate Skills: ${profile.skills.join(', ')}.
-      
-      Return JSON with:
-      - missingSkills: list of 3-5 critical skills missing.
-      - learningPath: array of { skill, resource (name of book/course/doc), actionItem }.
-      - projectIdea: A specific project idea to build to demonstrate these skills.
-    `;
-
-    try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: {
-                responseMimeType: 'application/json',
-                responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        missingSkills: { type: Type.ARRAY, items: { type: Type.STRING } },
-                        learningPath: { 
-                            type: Type.ARRAY, 
-                            items: { 
-                                type: Type.OBJECT, 
-                                properties: {
-                                    skill: { type: Type.STRING },
-                                    resource: { type: Type.STRING },
-                                    actionItem: { type: Type.STRING }
-                                } 
-                            } 
-                        },
-                        projectIdea: { type: Type.STRING }
-                    }
-                }
-            }
+    const fallback = {
+      missingSkills: ["Cloud Platforms", "System Design"],
+      learningPath: [{ skill: "Advanced Patterns", resource: "Docs", actionItem: "Build a project" }],
+      projectIdea: "Build a full-stack dashboard."
+    };
+    return runSmartAgent(async () => {
+        const ai = getAI();
+        if(!ai) throw new Error("No Key");
+        const res = await ai.models.generateContent({
+            model: MODEL_NAME,
+            contents: `Skill gap for ${profile.targetRoles[0]}. JSON: missingSkills[], learningPath[], projectIdea`,
+            config: { responseMimeType: 'application/json' }
         });
-        
-        return extractJSON(response.text || '{}') || { missingSkills: [], learningPath: [], projectIdea: "Analysis failed" };
-    } catch (e) {
-        console.error(e);
-        throw e;
-    }
+        return extractJSON(res.text || '{}') || fallback;
+    }, () => fallback);
 };

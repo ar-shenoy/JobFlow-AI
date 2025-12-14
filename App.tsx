@@ -7,21 +7,55 @@ import AutoPilot from './components/AutoPilot';
 import InterviewPrep from './components/InterviewPrep';
 import NetworkingHub from './components/NetworkingHub';
 import SkillGap from './components/SkillGap';
-import { LayoutDashboard, User, Search, PlayCircle, Bot, Menu, X, BrainCircuit, Share2, Rocket, AlertTriangle } from 'lucide-react';
+import KanbanBoard from './components/KanbanBoard';
+import ResumeOptimizer from './components/ResumeOptimizer';
+import { LayoutDashboard, User, Search, PlayCircle, Bot, Menu, X, BrainCircuit, Share2, Rocket, AlertTriangle, LogOut, Kanban, FileText } from 'lucide-react';
+
+const Toast = ({ message, type, onClose }: { message: string, type: 'success' | 'error' | 'info', onClose: () => void }) => {
+  useEffect(() => {
+    const timer = setTimeout(onClose, 3000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+
+  const colors = {
+    success: 'bg-green-600 border-green-500',
+    error: 'bg-red-600 border-red-500',
+    info: 'bg-blue-600 border-blue-500'
+  };
+
+  return (
+    <div className={`fixed top-4 right-4 z-50 ${colors[type]} text-white px-4 py-3 rounded-lg shadow-2xl border flex items-center gap-3 animate-in slide-in-from-right`}>
+      <span>{message}</span>
+      <button onClick={onClose} className="hover:opacity-75"><X size={14}/></button>
+    </div>
+  );
+};
 
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<View>(View.DASHBOARD);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [toast, setToast] = useState<{msg: string, type: 'success' | 'error' | 'info'} | null>(null);
   
-  // App State
+  // Initialize with all fields to prevent crashes in Profile component
   const [profile, setProfile] = useState<UserProfile>({
-    name: '',
-    email: '',
-    phone: '',
-    experienceLevel: 'Entry',
-    targetRoles: [],
-    locations: [],
-    resumeText: '',
+    name: '', 
+    email: '', 
+    phone: '', 
+    location: '', 
+    experienceLevel: 'Entry Level', 
+    targetRoles: [], 
+    preferredRegions: [], 
+    jobTypes: [], 
+    remoteOnly: false, 
+    workStyle: 'Remote', 
+    salaryExpectation: '',
+    matchThreshold: 60,
+    visaSponsorship: false,
+    noticePeriod: '', 
+    linkedinUrl: '', 
+    portfolioUrl: '', 
+    education: '',
+    resumeText: '', 
     skills: []
   });
 
@@ -30,34 +64,38 @@ const App: React.FC = () => {
   const [isAutoPilotRunning, setIsAutoPilotRunning] = useState(false);
   const [stats, setStats] = useState({ totalFound: 0, applied: 0, skipped: 0 });
 
-  // API Key Check
-  const apiKey = process.env.API_KEY;
-  const isKeyMissing = !apiKey || apiKey === "undefined" || apiKey.includes("your_key");
-
-  // Load from LocalStorage
+  // Load state
   useEffect(() => {
     try {
       const saved = localStorage.getItem('jobflow_state');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.profile) setProfile(parsed.profile);
+        if (parsed.profile) {
+          // Merge saved profile with default structure to ensure new fields exist
+          setProfile(prev => ({ 
+            ...prev, 
+            ...parsed.profile,
+            // Explicitly ensure arrays are not undefined if loading old data
+            preferredRegions: parsed.profile.preferredRegions || [],
+            jobTypes: parsed.profile.jobTypes || [],
+            targetRoles: parsed.profile.targetRoles || [],
+            skills: parsed.profile.skills || []
+          }));
+        }
         if (parsed.jobs) setJobs(parsed.jobs);
         if (parsed.logs) setLogs(parsed.logs.map((l: any) => ({...l, timestamp: new Date(l.timestamp)})));
       }
-    } catch (e) {
-      console.error("Failed to load state", e);
-    }
+    } catch (e) { console.error("Load error", e); }
   }, []);
 
-  // Save to LocalStorage
+  // Save state
   useEffect(() => {
     const timeout = setTimeout(() => {
-      localStorage.setItem('jobflow_state', JSON.stringify({ profile, jobs, logs: logs.slice(-50) })); // Keep last 50 logs only to save space
+      localStorage.setItem('jobflow_state', JSON.stringify({ profile, jobs, logs: logs.slice(-50) }));
     }, 1000);
     return () => clearTimeout(timeout);
   }, [profile, jobs, logs]);
 
-  // Update stats whenever job list changes
   useEffect(() => {
     setStats({
       totalFound: jobs.length,
@@ -66,235 +104,105 @@ const App: React.FC = () => {
     });
   }, [jobs]);
 
+  const showToast = (msg: string, type: 'success' | 'error' | 'info' = 'info') => setToast({ msg, type });
   const addLog = (message: string, type: AutomationLog['type'] = 'info') => {
-    setLogs(prev => [...prev, {
-      id: Math.random().toString(36),
-      timestamp: new Date(),
-      message,
-      type
-    }]);
+    setLogs(prev => [...prev, { id: Math.random().toString(36), timestamp: new Date(), message, type }]);
   };
-
   const addJobsToQueue = (newJobs: JobListing[]) => {
     setJobs(prev => {
-      // Dedup based on URL or title+company
       const existingIds = new Set(prev.map(j => j.url));
       const filtered = newJobs.filter(j => !existingIds.has(j.url));
       return [...prev, ...filtered];
     });
-    addLog(`Added ${newJobs.length} new jobs to the automation queue.`, 'info');
+    addLog(`Added ${newJobs.length} new jobs to queue.`, 'info');
+    showToast(`Added ${newJobs.length} jobs to AutoPilot`, 'success');
   };
+  const updateStats = () => {};
 
-  const updateStats = (key: 'applied' | 'skipped') => {
-    // handled by effect
+  const handleReset = () => {
+    if(confirm("Clear all data?")) {
+      localStorage.removeItem('jobflow_state');
+      window.location.reload();
+    }
   };
 
   const renderView = () => {
     switch (currentView) {
-      case View.DASHBOARD:
-        return <Dashboard profile={profile} stats={stats} recentJobs={[...jobs].reverse()} />;
-      case View.PROFILE:
-        return <Profile profile={profile} setProfile={setProfile} />;
-      case View.SEARCH:
-        return <JobSearch profile={profile} addJobsToQueue={addJobsToQueue} />;
-      case View.AUTOPILOT:
-        return (
-          <AutoPilot 
-            jobs={jobs} 
-            setJobs={setJobs} 
-            profile={profile}
-            isRunning={isAutoPilotRunning}
-            setIsRunning={setIsAutoPilotRunning}
-            logs={logs}
-            addLog={addLog}
-            stats={stats}
-            updateStats={updateStats}
-          />
-        );
-      case View.INTERVIEW:
-        return <InterviewPrep jobs={jobs} setJobs={setJobs} profile={profile} />;
-      case View.NETWORKING:
-        return <NetworkingHub profile={profile} jobs={jobs} />;
-      case View.SKILLS:
-        return <SkillGap profile={profile} />;
-      default:
-        return <Dashboard profile={profile} stats={stats} recentJobs={jobs} />;
+      case View.DASHBOARD: return <Dashboard profile={profile} stats={stats} recentJobs={[...jobs].reverse()} />;
+      case View.PROFILE: return <Profile profile={profile} setProfile={setProfile} showToast={showToast} />;
+      case View.SEARCH: return <JobSearch profile={profile} addJobsToQueue={addJobsToQueue} showToast={showToast} />;
+      case View.AUTOPILOT: return <AutoPilot jobs={jobs} setJobs={setJobs} profile={profile} isRunning={isAutoPilotRunning} setIsRunning={setIsAutoPilotRunning} logs={logs} addLog={addLog} stats={stats} updateStats={updateStats} showToast={showToast} />;
+      case View.KANBAN: return <KanbanBoard jobs={jobs} setJobs={setJobs} />;
+      case View.OPTIMIZER: return <ResumeOptimizer profile={profile} jobs={jobs} />;
+      case View.INTERVIEW: return <InterviewPrep jobs={jobs} setJobs={setJobs} profile={profile} />;
+      case View.NETWORKING: return <NetworkingHub profile={profile} jobs={jobs} />;
+      case View.SKILLS: return <SkillGap profile={profile} />;
+      default: return <Dashboard profile={profile} stats={stats} recentJobs={jobs} />;
     }
   };
 
-  // Block rendering if API Key is missing
-  if (isKeyMissing) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-slate-950 text-white p-6">
-        <div className="max-w-lg w-full bg-slate-900 border border-slate-800 rounded-xl p-8 shadow-2xl text-center space-y-6">
-           <div className="bg-red-500/10 w-16 h-16 rounded-full flex items-center justify-center mx-auto">
-             <AlertTriangle className="text-red-500" size={32} />
-           </div>
-           <div>
-             <h1 className="text-2xl font-bold mb-2">Configuration Missing</h1>
-             <p className="text-slate-400">The application cannot start because the <code className="text-blue-400 font-mono">API_KEY</code> is missing.</p>
-           </div>
-           
-           <div className="text-left bg-slate-950 p-4 rounded-lg border border-slate-800 text-sm space-y-3 font-mono">
-              <p className="text-slate-500">How to fix:</p>
-              <div>
-                <strong className="text-slate-300 block">Option 1: Local Development</strong>
-                <span className="text-slate-500">Create a </span><span className="text-yellow-400">.env</span><span className="text-slate-500"> file in the root folder:</span>
-                <div className="bg-black/50 p-2 mt-1 rounded text-green-400">API_KEY=your_key_here</div>
-              </div>
-              <div>
-                <strong className="text-slate-300 block">Option 2: Vercel / Cloud</strong>
-                <span className="text-slate-500">Go to Settings &gt; Environment Variables and add </span>
-                <span className="text-blue-400">API_KEY</span>.
-              </div>
-           </div>
-           
-           <button onClick={() => window.location.reload()} className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded-lg font-medium transition-colors w-full">
-             Refresh App
-           </button>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans selection:bg-blue-500/30 overflow-hidden">
-      
-      {/* Mobile Sidebar Overlay */}
-      {isSidebarOpen && (
-        <div 
-          className="fixed inset-0 bg-black/50 z-30 md:hidden"
-          onClick={() => setIsSidebarOpen(false)}
-        />
-      )}
+    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden">
+      {toast && <Toast message={toast.msg} type={toast.type} onClose={() => setToast(null)} />}
 
-      {/* Sidebar Navigation */}
-      <aside className={`
-        fixed inset-y-0 left-0 z-40 w-64 bg-slate-900 border-r border-slate-800 flex flex-col transition-transform duration-300 ease-in-out
-        md:translate-x-0 md:static md:z-0
-        ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-      `}>
-        <div className="p-6 border-b border-slate-800 flex items-center justify-between">
+      <aside className={`fixed inset-y-0 left-0 z-40 w-64 bg-slate-900 border-r border-slate-800 flex flex-col transition-transform duration-300 md:translate-x-0 md:static ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+        <div className="p-6 border-b border-slate-800 flex justify-between items-center">
           <div className="flex items-center gap-3">
-            <div className="bg-blue-600 p-2 rounded-lg">
-              <Bot className="text-white" size={24} />
+            <div className="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-lg">
+              <Bot className="text-white" size={20} />
             </div>
-            <div>
-              <h1 className="font-bold text-white text-lg leading-tight">JobFlow AI</h1>
-              <span className="text-xs text-blue-400 font-mono">v2.0.0</span>
-            </div>
+            <span className="font-bold text-white text-lg">JobFlow</span>
           </div>
-          <button onClick={() => setIsSidebarOpen(false)} className="md:hidden text-slate-400">
-            <X size={24} />
-          </button>
+          <button onClick={() => setIsSidebarOpen(false)} className="md:hidden"><X size={20}/></button>
         </div>
 
-        <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
-          <NavButton 
-            active={currentView === View.DASHBOARD} 
-            onClick={() => { setCurrentView(View.DASHBOARD); setIsSidebarOpen(false); }} 
-            icon={<LayoutDashboard size={20} />} 
-            label="Dashboard" 
-          />
-          <NavButton 
-            active={currentView === View.PROFILE} 
-            onClick={() => { setCurrentView(View.PROFILE); setIsSidebarOpen(false); }} 
-            icon={<User size={20} />} 
-            label="Profile & CV" 
-          />
-          <NavButton 
-            active={currentView === View.SEARCH} 
-            onClick={() => { setCurrentView(View.SEARCH); setIsSidebarOpen(false); }} 
-            icon={<Search size={20} />} 
-            label="Job Discovery" 
-          />
-          <NavButton 
-            active={currentView === View.AUTOPILOT} 
-            onClick={() => { setCurrentView(View.AUTOPILOT); setIsSidebarOpen(false); }} 
-            icon={<PlayCircle size={20} />} 
-            label="AutoPilot" 
-            badge={isAutoPilotRunning ? 'ON' : undefined}
-          />
-          <NavButton 
-            active={currentView === View.INTERVIEW} 
-            onClick={() => { setCurrentView(View.INTERVIEW); setIsSidebarOpen(false); }} 
-            icon={<BrainCircuit size={20} />} 
-            label="Interview Prep" 
-          />
-          <NavButton 
-            active={currentView === View.NETWORKING} 
-            onClick={() => { setCurrentView(View.NETWORKING); setIsSidebarOpen(false); }} 
-            icon={<Share2 size={20} />} 
-            label="Networking Hub" 
-          />
-          <NavButton 
-            active={currentView === View.SKILLS} 
-            onClick={() => { setCurrentView(View.SKILLS); setIsSidebarOpen(false); }} 
-            icon={<Rocket size={20} />} 
-            label="Skills & Learning" 
-            badge="NEW"
-          />
+        <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+          {[
+            { id: View.DASHBOARD, icon: LayoutDashboard, label: 'Dashboard' },
+            { id: View.PROFILE, icon: User, label: 'Profile' },
+            { id: View.SEARCH, icon: Search, label: 'Discovery' },
+            { id: View.AUTOPILOT, icon: PlayCircle, label: 'AutoPilot', active: isAutoPilotRunning },
+            { id: View.KANBAN, icon: Kanban, label: 'Pipeline', badge: 'NEW' },
+            { id: View.OPTIMIZER, icon: FileText, label: 'Optimizer', badge: 'AI' },
+            { id: View.INTERVIEW, icon: BrainCircuit, label: 'Interview Prep' },
+            { id: View.NETWORKING, icon: Share2, label: 'Networking' },
+            { id: View.SKILLS, icon: Rocket, label: 'Skill Gap' },
+          ].map(item => (
+            <button
+              key={item.id}
+              onClick={() => { setCurrentView(item.id); setIsSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-all ${
+                currentView === item.id 
+                  ? 'bg-blue-600/10 text-blue-400 border border-blue-600/20' 
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+              }`}
+            >
+              <item.icon size={18} className={item.active ? "animate-pulse text-green-400" : ""} />
+              <span className="font-medium">{item.label}</span>
+              {item.badge && <span className="ml-auto text-[10px] bg-purple-500 text-white px-1.5 py-0.5 rounded">{item.badge}</span>}
+            </button>
+          ))}
         </nav>
 
         <div className="p-4 border-t border-slate-800">
-          <div className="bg-slate-800 rounded-lg p-3 text-xs text-slate-400">
-            <p className="font-semibold text-white mb-1">Status: Online</p>
-            <p>System Optimized</p>
-          </div>
+           <button onClick={handleReset} className="w-full flex items-center gap-2 text-slate-500 hover:text-red-400 text-xs px-2 py-2 transition-colors">
+              <LogOut size={14} /> Reset Data
+           </button>
         </div>
       </aside>
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col h-full w-full relative">
-        {/* Mobile Header */}
+      <main className="flex-1 flex flex-col h-full relative">
         <div className="md:hidden flex items-center p-4 border-b border-slate-800 bg-slate-900">
-          <button onClick={() => setIsSidebarOpen(true)} className="text-slate-200 mr-4">
-            <Menu size={24} />
-          </button>
+          <button onClick={() => setIsSidebarOpen(true)} className="mr-4"><Menu size={24}/></button>
           <span className="font-bold text-white">JobFlow AI</span>
         </div>
-
-        {/* Background Pattern */}
-        <div className="absolute inset-0 z-0 opacity-10 pointer-events-none" style={{
-          backgroundImage: 'radial-gradient(circle at 2px 2px, #3b82f6 1px, transparent 0)',
-          backgroundSize: '40px 40px'
-        }}></div>
-
-        <div className="relative z-10 flex-1 overflow-auto">
+        <div className="absolute inset-0 z-0 opacity-20 pointer-events-none" style={{ backgroundImage: 'radial-gradient(circle at 1px 1px, #3b82f6 1px, transparent 0)', backgroundSize: '40px 40px' }}></div>
+        <div className="relative z-10 flex-1 overflow-auto scroll-smooth">
            {renderView()}
         </div>
       </main>
     </div>
   );
 };
-
-interface NavButtonProps {
-  active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
-  label: string;
-  badge?: string;
-}
-
-const NavButton: React.FC<NavButtonProps> = ({ active, onClick, icon, label, badge }) => (
-  <button
-    onClick={onClick}
-    className={`w-full flex items-center justify-between px-4 py-3 rounded-lg transition-all duration-200 ${
-      active 
-        ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' 
-        : 'text-slate-400 hover:bg-slate-800 hover:text-white'
-    }`}
-  >
-    <div className="flex items-center gap-3">
-      {icon}
-      <span className="font-medium">{label}</span>
-    </div>
-    {badge && (
-      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${badge === 'NEW' ? 'bg-purple-500 text-white' : 'bg-green-500 text-white animate-pulse'}`}>
-        {badge}
-      </span>
-    )}
-  </button>
-);
 
 export default App;

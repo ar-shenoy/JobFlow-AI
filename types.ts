@@ -2,12 +2,32 @@ export interface UserProfile {
   name: string;
   email: string;
   phone: string;
-  experienceLevel: 'Entry' | 'Mid' | 'Senior' | 'Executive';
+  location: string; // Current physical location
+  
+  // New granular preferences
+  experienceLevel: 'Internship' | 'Entry Level' | 'Associate' | 'Mid-Senior Level' | 'Director' | 'Executive';
+  jobTypes: string[]; // e.g. ['Full-time', 'Contract']
+  remoteOnly: boolean;
   targetRoles: string[];
-  locations: string[];
-  resumeText: string; // Extracted text
-  resumeBase64?: string; // Original file for analysis
+  preferredRegions: string[]; // e.g. ['Europe', 'United States']
+  workStyle: 'Remote' | 'Hybrid' | 'On-site' | 'Any';
+  
+  // Sliders & Advanced
+  matchThreshold: number; // 0-100
+  salaryExpectation: string;
+  noticePeriod: string;
+  visaSponsorship: boolean;
+  
+  linkedinUrl: string;
+  portfolioUrl: string;
+  education: string;
+  resumeText: string;
+  resumeBase64?: string;
   skills: string[];
+  
+  // Premium Features
+  aiPersona?: string; // e.g. "Senior Full Stack Architect"
+  profileStrength?: number; // 0-100
 }
 
 export interface InterviewQuestion {
@@ -22,14 +42,21 @@ export interface JobListing {
   company: string;
   location: string;
   url: string;
-  description: string; // Summary or full
+  description: string;
   source: string;
   postedDate?: string;
   matchScore?: number;
-  status: 'new' | 'analyzing' | 'applying' | 'applied' | 'failed' | 'skipped';
+  status: 'new' | 'analyzing' | 'skipped' | 'applied' | 'interviewing' | 'offer' | 'rejected' | 'failed';
   generatedCoverLetter?: string;
   applicationNotes?: string;
   interviewPrep?: InterviewQuestion[];
+}
+
+export interface ResumeOptimization {
+  score: number;
+  missingKeywords: string[];
+  suggestedImprovements: string[];
+  optimizedSummary: string;
 }
 
 export interface SkillGapAnalysis {
@@ -67,8 +94,9 @@ export enum View {
   PROFILE = 'PROFILE',
   SEARCH = 'SEARCH',
   AUTOPILOT = 'AUTOPILOT',
+  KANBAN = 'KANBAN',
+  OPTIMIZER = 'OPTIMIZER',
   INTERVIEW = 'INTERVIEW',
   NETWORKING = 'NETWORKING',
-  SKILLS = 'SKILLS',
-  REPORTS = 'REPORTS'
+  SKILLS = 'SKILLS'
 }

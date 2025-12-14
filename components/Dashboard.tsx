@@ -122,9 +122,9 @@ const Dashboard: React.FC<DashboardProps> = memo(({ profile, stats, recentJobs }
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Chart */}
-        <div className="bg-slate-800 p-4 md:p-6 rounded-xl border border-slate-700 min-h-[300px]">
+        <div className="bg-slate-800 p-4 md:p-6 rounded-xl border border-slate-700 min-h-[350px]">
           <h3 className="text-lg font-semibold text-white mb-6">Application Metrics</h3>
-          <div className="h-64">
+          <div style={{ width: '100%', height: 250 }}>
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={data} layout="vertical" margin={{ left: 20 }}>
                 <XAxis type="number" hide />
@@ -141,7 +141,7 @@ const Dashboard: React.FC<DashboardProps> = memo(({ profile, stats, recentJobs }
         </div>
 
         {/* Recent Activity */}
-        <div className="bg-slate-800 p-4 md:p-6 rounded-xl border border-slate-700 min-h-[300px] overflow-hidden">
+        <div className="bg-slate-800 p-4 md:p-6 rounded-xl border border-slate-700 min-h-[350px] overflow-hidden">
           <h3 className="text-lg font-semibold text-white mb-6">Recent Activity</h3>
           <div className="space-y-4">
             {recentJobs.slice(0, 5).map(job => (
