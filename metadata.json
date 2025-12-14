@@ -1,0 +1,5 @@
+{
+  "name": "JobFlow AI",
+  "description": "An intelligent, automated job application assistant. It uses Gemini to parse your CV, search for real-time job listings using Google Search Grounding, and automatically generate tailored cover letters and application assets.",
+  "requestFramePermissions": []
+}
